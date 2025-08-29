@@ -1,21 +1,24 @@
-cmake_minimum_required(VERSION 3.7.2)
+cmake_minimum_required(VERSION 3.8)
 project(rosserial_msgs)
 
-find_package(catkin REQUIRED COMPONENTS
-  message_generation
+find_package(ament_cmake REQUIRED)
+find_package(rosidl_default_generators REQUIRED)
+
+set(msg_files
+  "msg/Log.msg"
+  "msg/TopicInfo.msg"
 )
 
-add_message_files(FILES
-  Log.msg
-  TopicInfo.msg
+set(srv_files
+  "srv/RequestParam.srv"
 )
 
-add_service_files(FILES
-  RequestParam.srv
+rosidl_generate_interfaces(${PROJECT_NAME}
+  ${msg_files}
+  ${srv_files}
+  ADD_LINTER_TESTS
 )
 
-generate_messages()
+ament_export_dependencies(rosidl_default_runtime)
 
-catkin_package(CATKIN_DEPENDS
-  message_runtime
-)
+ament_package()
