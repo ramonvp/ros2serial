@@ -26,6 +26,8 @@
  *
  * Please send comments, questions, or patches to code@clearpathrobotics.com
  */
+#ifndef ROSSERIAL_SERVER_MSG_LOOKUP_H
+#define ROSSERIAL_SERVER_MSG_LOOKUP_H
 
 #include <string>
 #include <stdexcept>
@@ -35,10 +37,13 @@ namespace rosserial_server
 
 struct MsgInfo
 {
-  std::string md5sum;
-  std::string full_text;
+    std::string md5sum;
+    std::string full_text;
 };
 
-const MsgInfo lookupMessage(const std::string& message_type, const std::string submodule = "msg");
+// interface_name is usually in the form of "std_msgs/msg/Int32"
+const MsgInfo lookupMessage(const std::string& interface_name, const std::string &suffix = "");
 
 }  // namespace rosserial_server
+
+#endif

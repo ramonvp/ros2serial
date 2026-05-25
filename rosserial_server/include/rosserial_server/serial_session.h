@@ -35,12 +35,13 @@
 #define ROSSERIAL_SERVER_SERIAL_SESSION_H
 
 #include <iostream>
-#include <boost/bind.hpp>
+#include <boost/bind/bind.hpp>
 #include <boost/asio.hpp>
 
-#include <ros/ros.h>
+#include <rclcpp/rclcpp.hpp>
 
 #include "rosserial_server/session.h"
+#include <linux/serial.h>
 
 namespace rosserial_server
 {
@@ -48,10 +49,10 @@ namespace rosserial_server
 class SerialSession : public Session<boost::asio::serial_port>
 {
 public:
-  SerialSession(boost::asio::io_service& io_service, std::string port, int baud)
-    : Session(io_service), port_(port), baud_(baud), timer_(io_service)
+  SerialSession(std::shared_ptr<rclcpp::Node> node, boost::asio::io_service& io_service, std::string port, int baud)
+    : Session(node, io_service), port_(port), baud_(baud), timer_(io_service)
   {
-    ROS_INFO_STREAM("rosserial_server session configured for " << port_ << " at " << baud << "bps.");
+    RCLCPP_INFO_STREAM(node_->get_logger(), "rosserial_server session configured for " << port_ << " at " << baud << "bps.");
 
     failed_connection_attempts_ = 0;
     check_connection();
@@ -67,7 +68,7 @@ private:
 
     // Every second, check again if the connection should be reinitialized,
     // if the ROS node is still up.
-    if (ros::ok())
+    if (rclcpp::ok())
     {
       timer_.expires_from_now(boost::posix_time::milliseconds(2000));
       timer_.async_wait(boost::bind(&SerialSession::check_connection, this));
@@ -80,20 +81,20 @@ private:
 
   void attempt_connection()
   {
-    ROS_DEBUG("Opening serial port.");
+    RCLCPP_DEBUG(node_->get_logger(), "Opening serial port.");
 
     boost::system::error_code ec;
     socket().open(port_, ec);
     if (ec) {
       failed_connection_attempts_++;
       if (failed_connection_attempts_ == 1) {
-        ROS_ERROR_STREAM("Unable to open port " << port_ << ": " << ec);
+        RCLCPP_ERROR_STREAM(node_->get_logger(), "Unable to open port " << port_ << ": " << ec);
       } else {
-        ROS_DEBUG_STREAM("Unable to open port " << port_ << " (" << failed_connection_attempts_ << "): " << ec);
+        RCLCPP_DEBUG_STREAM(node_->get_logger(), "Unable to open port " << port_ << " (" << failed_connection_attempts_ << "): " << ec);
       }
       return;
     }
-    ROS_INFO_STREAM("Opened " << port_);
+    RCLCPP_INFO_STREAM(node_->get_logger(), "Opened " << port_);
     failed_connection_attempts_ = 0;
 
     typedef boost::asio::serial_port_base serial;
@@ -102,6 +103,23 @@ private:
     socket().set_option(serial::stop_bits(serial::stop_bits::one));
     socket().set_option(serial::parity(serial::parity::none));
     socket().set_option(serial::flow_control(serial::flow_control::none));
+
+    boost::asio::serial_port::native_handle_type native = socket().native_handle();
+    struct serial_struct serial_ops;
+    ioctl(native, TIOCGSERIAL, &serial_ops);
+    serial_ops.flags |= ASYNC_LOW_LATENCY; // (0x2000)
+    ioctl(native, TIOCSSERIAL, &serial_ops);
+
+    // Required to sleep and flush under Ubuntu 24 after opening file descriptor
+    // see: https://stackoverflow.com/questions/13013387/clearing-the-serial-ports-buffer
+    // Additionally, Arduino Uno boards gets reset with DTR signal every time the serial
+    // port is opened, hence, we need to wait a bit until the firmware on the Arduino is
+    // really running and attending the serial port communication.
+    unsigned int wait_seconds = 2;
+    RCLCPP_INFO(node_->get_logger(), "Waiting %u seconds for driver ready", wait_seconds);
+    sleep(wait_seconds);
+    RCLCPP_INFO_STREAM(node_->get_logger(), "Flushing serial port");
+    tcflush(native,TCIOFLUSH);
 
     // Kick off the session.
     start();

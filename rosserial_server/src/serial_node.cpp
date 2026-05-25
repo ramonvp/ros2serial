@@ -32,25 +32,98 @@
  */
 
 #include <boost/asio.hpp>
-#include <boost/bind.hpp>
-#include <boost/thread.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <rosserial_server/serial_session.h>
 
-#include <ros/ros.h>
+#include "rosserial_server/msg_lookup.h"
 
-#include "rosserial_server/serial_session.h"
+#include <std_srvs/srv/set_bool.hpp>
+#include <std_srvs/srv/trigger.hpp>
+#include <std_srvs/srv/empty.hpp>
+
+#include <introspection_interfaces/srv/test.hpp>
+
+#define ENABLE_RATE 0
+
+void run_io_service(boost::asio::io_service* io_service)
+{
+    io_service->run();
+}
+
+int test_lookup_interfaces()
+{
+    rosserial_server::MsgInfo msginfo = rosserial_server::lookupMessage("std_msgs/msg/Int32");
+    std::cout << "message_hash = " << msginfo.md5sum << std::endl;
+
+    rosserial_server::MsgInfo srvinfo;
+    rosserial_server::MsgInfo reqinfo;
+    rosserial_server::MsgInfo respinfo;
+
+    std::string message_type = "std_srvs/srv/SetBool";
+
+    srvinfo = rosserial_server::lookupMessage(message_type);
+    reqinfo = rosserial_server::lookupMessage(message_type, "_Request");
+    respinfo = rosserial_server::lookupMessage(message_type, "_Response");
+
+    std::cout << "service_md5 = " << srvinfo.md5sum << std::endl;
+    std::cout << "request_message_md5_ = " << reqinfo.md5sum << std::endl;
+    std::cout << "response_message_md5_ = " << respinfo.md5sum << std::endl;
+
+    return 0;
+}
+
+rosserial_server::ConversionMap createConversionMap()
+{
+    rosserial_server::ConversionMap converter_map;
+
+    //ADD_MAP_ENTRY(converter_map, introspection_interfaces::srv::Test);
+    ADD_MAP_ENTRY(converter_map, std_srvs::srv::SetBool);
+    ADD_MAP_ENTRY(converter_map, std_srvs::srv::Trigger);
+    ADD_MAP_ENTRY(converter_map, std_srvs::srv::Empty);
+
+    ADD_MAP_ENTRY(converter_map, introspection_interfaces::srv::Test);
+
+    return converter_map;
+}
 
 
 int main(int argc, char* argv[])
 {
-  ros::init(argc, argv, "rosserial_server_serial_node");
+    //return test_lookup_interfaces();
 
-  std::string port;
-  int baud;
-  ros::param::param<std::string>("~port", port, "/dev/ttyACM0");
-  ros::param::param<int>("~baud", baud, 57600);
+    rclcpp::init(argc, argv);
+    std::shared_ptr<rclcpp::Node> node = rclcpp::Node::make_shared("rosserial_server_serial_node");
+    //TODO (if required): ros_helper::waitForRosout();
+    node->declare_parameter("port", "/dev/ttyACM0");
+    node->declare_parameter("baud", 57600);
 
-  boost::asio::io_service io_service;
-  rosserial_server::SerialSession serial_session(io_service, port, baud);
-  io_service.run();
-  return 0;
+    std::string port;
+    int baud;
+
+    node->get_parameter("port", port);
+    node->get_parameter("baud", baud);
+
+    boost::asio::io_service io_service;
+    auto serial_session = std::make_shared<rosserial_server::SerialSession>(node, io_service, port, baud);
+    serial_session->setServicesMap(createConversionMap());
+    std::thread t(run_io_service, &io_service);
+
+#if ENABLE_RATE
+  rclcpp::Rate loop_rate(1);
+  while (rclcpp::ok())
+  {
+    fprintf(stderr, "Inside the loop...\n");
+    rclcpp::spin_some(node);
+    loop_rate.sleep();
+  }
+#else
+    //rclcpp::executors::MultiThreadedExecutor executor;
+    //executor.add_node(node);
+    //executor.spin();
+    rclcpp::spin(node);
+#endif
+  t.join();
+  rclcpp::shutdown();
+
+  return EXIT_SUCCESS;
 }

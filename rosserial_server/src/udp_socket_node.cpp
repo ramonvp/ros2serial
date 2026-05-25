@@ -61,5 +61,5 @@ int main(int argc, char* argv[])
       udp::endpoint(address::from_string(client_addr), client_port));
   io_service.run();
 
-  return 0;
+  return EXIT_SUCCESS;
 }

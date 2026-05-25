@@ -36,58 +36,68 @@
 #define ROSSERIAL_SERVER_SESSION_H
 
 #include <map>
-#include <boost/bind.hpp>
+#include <boost/bind/bind.hpp>
 #include <boost/asio.hpp>
 #include <boost/function.hpp>
+#include <boost/thread.hpp>
+#include <boost/core/noncopyable.hpp>
 
-#include <ros/callback_queue.h>
-#include <ros/ros.h>
-#include <rosserial_msgs/TopicInfo.h>
-#include <rosserial_msgs/Log.h>
-#include <topic_tools/shape_shifter.h>
-#include <std_msgs/Time.h>
+#include <rclcpp/rclcpp.hpp>
+#include <rclcpp/serialization.hpp>
+
+#include <rosserial_msgs/msg/topic_info.hpp>
+#include <rosserial_msgs/msg/log.hpp>
+#include <builtin_interfaces/msg/time.hpp>
 
 #include "rosserial_server/async_read_buffer.h"
 #include "rosserial_server/topic_handlers.h"
+#include "rosserial_server/services.h"
+
+#include <rcpputils/asserts.hpp>
 
 namespace rosserial_server
 {
 
 typedef std::vector<uint8_t> Buffer;
-typedef boost::shared_ptr<Buffer> BufferPtr;
+typedef std::shared_ptr<Buffer> BufferPtr;
+
 
 template<typename Socket>
-class Session : boost::noncopyable
+class Session : public boost::noncopyable /*, public rclcpp::Node*/
 {
 public:
-  Session(boost::asio::io_service& io_service)
-    : io_service_(io_service),
+  Session(std::shared_ptr<rclcpp::Node> node, boost::asio::io_service& io_service)
+    : node_(node),
+      io_service_(io_service),
       socket_(io_service),
       sync_timer_(io_service),
       require_check_timer_(io_service),
       ros_spin_timer_(io_service),
-      async_read_buffer_(socket_, buffer_max,
+      async_read_buffer_(node_, socket_, buffer_max,
                          boost::bind(&Session::read_failed, this,
                                      boost::asio::placeholders::error))
   {
     active_ = false;
 
     timeout_interval_ = boost::posix_time::milliseconds(5000);
-    attempt_interval_ = boost::posix_time::milliseconds(1000);
-    require_check_interval_ = boost::posix_time::milliseconds(1000);
-    ros_spin_interval_ = boost::posix_time::milliseconds(10);
+    attempt_interval_ = boost::posix_time::milliseconds(1500); //was 1 second, could be not enough  1500
+    require_check_interval_ = boost::posix_time::milliseconds(1500); //was 1 second, could be not enough
     require_param_name_ = "~require";
 
-    unrecognised_topic_retry_threshold_ = ros::param::param("~unrecognised_topic_retry_threshold", 0);
+    node->declare_parameter("unrecognised_topic_retry_threshold", 1);
+    node->declare_parameter("services_no_response_timeout_ms", 2000);
 
-    nh_.setCallbackQueue(&ros_callback_queue_);
+
+    node->get_parameter("unrecognised_topic_retry_threshold", unrecognised_topic_retry_threshold_); // It was 0 previously
+    node->get_parameter("services_no_response_timeout_ms", services_no_response_timeout_ms_); // 2seg by default, previously was 5seg.
+
 
     // Intermittent callback to service ROS callbacks. To avoid polling like this,
     // CallbackQueue could in the future be extended with a scheme to monitor for
     // callbacks on another thread, and then queue them up to be executed on this one.
-    ros_spin_timer_.expires_from_now(ros_spin_interval_);
+    /*ros_spin_timer_.expires_from_now(ros_spin_interval_);
     ros_spin_timer_.async_wait(boost::bind(&Session::ros_spin_timeout, this,
-                                           boost::asio::placeholders::error));
+                                           boost::asio::placeholders::error));*/
   }
 
   Socket& socket()
@@ -95,22 +105,27 @@ public:
     return socket_;
   }
 
+  void setServicesMap(const ConversionMap& services_map)
+  {
+        services_map_ = services_map;
+  }
+
   void start()
   {
-    ROS_DEBUG("Starting session.");
+    using namespace rosserial_msgs::msg;
+    using namespace std::placeholders;
 
-    callbacks_[rosserial_msgs::TopicInfo::ID_PUBLISHER]
-        = boost::bind(&Session::setup_publisher, this, _1);
-    callbacks_[rosserial_msgs::TopicInfo::ID_SUBSCRIBER]
-        = boost::bind(&Session::setup_subscriber, this, _1);
-    callbacks_[rosserial_msgs::TopicInfo::ID_SERVICE_CLIENT+rosserial_msgs::TopicInfo::ID_PUBLISHER]
-        = boost::bind(&Session::setup_service_client_publisher, this, _1);
-    callbacks_[rosserial_msgs::TopicInfo::ID_SERVICE_CLIENT+rosserial_msgs::TopicInfo::ID_SUBSCRIBER]
-        = boost::bind(&Session::setup_service_client_subscriber, this, _1);
-    callbacks_[rosserial_msgs::TopicInfo::ID_LOG]
-        = boost::bind(&Session::handle_log, this, _1);
-    callbacks_[rosserial_msgs::TopicInfo::ID_TIME]
-        = boost::bind(&Session::handle_time, this, _1);
+    RCLCPP_INFO(node_->get_logger(), "[Rosserial::Session::start] Starting session.");
+
+    callbacks_[TopicInfo::ID_PUBLISHER] = std::bind(&Session::setup_publisher, this, _1);
+    callbacks_[TopicInfo::ID_SUBSCRIBER] = std::bind(&Session::setup_subscriber, this, _1);
+    callbacks_[TopicInfo::ID_LOG] = std::bind(&Session::handle_log, this, _1);
+    callbacks_[TopicInfo::ID_TIME] = std::bind(&Session::handle_time, this, _1);
+
+    callbacks_[TopicInfo::ID_SERVICE_CLIENT+TopicInfo::ID_PUBLISHER]  = std::bind(&Session::setup_service_client_publisher, this, _1);
+    callbacks_[TopicInfo::ID_SERVICE_CLIENT+TopicInfo::ID_SUBSCRIBER] = std::bind(&Session::setup_service_client_subscriber, this, _1);
+    callbacks_[TopicInfo::ID_SERVICE_SERVER+TopicInfo::ID_PUBLISHER]  = std::bind(&Session::setup_service_server_publisher, this, _1);
+    callbacks_[TopicInfo::ID_SERVICE_SERVER+TopicInfo::ID_SUBSCRIBER] = std::bind(&Session::setup_service_server_subscriber, this, _1);
 
     active_ = true;
     attempt_sync();
@@ -119,23 +134,33 @@ public:
 
   void stop()
   {
-    // Abort any pending ROS callbacks.
-    ros_callback_queue_.clear();
+    if(is_active())
+    {
+      RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::stop] Request stop");
+      active_ = false;
+      // Abort any pending ROS callbacks.
+      //ros_callback_queue_.clear();
 
-    // Abort active session timer callbacks, if present.
-    sync_timer_.cancel();
-    require_check_timer_.cancel();
+      // Abort active session timer callbacks, if present.
+      sync_timer_.cancel();
+      require_check_timer_.cancel();
 
-    // Reset the state of the session, dropping any publishers or subscribers
-    // we currently know about from this client.
-    callbacks_.clear();
-    subscribers_.clear();
-    publishers_.clear();
-    services_.clear();
+      // Reset the state of the session, dropping any publishers or subscribers
+      // we currently know about from this client.
+      callbacks_.clear();
+      topics_names_.clear();
+      subscribers_.clear();
+      publishers_.clear();
+      service_clients_.clear();
+      service_servers_.clear();
 
-    // Close the socket.
-    socket_.close();
-    active_ = false;
+      // Send disconnection message
+      std::vector<uint8_t> message(1);
+      write_message(message, rosserial_msgs::msg::TopicInfo::ID_TX_STOP);
+
+      // Close the socket.
+      socket_.close();
+    }
   }
 
   void shutdown()
@@ -147,7 +172,7 @@ public:
     io_service_.stop();
   }
 
-  bool is_active()
+  bool is_active() const
   {
     return active_;
   }
@@ -158,10 +183,13 @@ public:
    * with something else in that namespace, or because you're embedding
    * multiple instances of rosserial_server in a single process.
    */
-  void set_require_param(std::string param_name)
+  void set_require_param(const std::string & param_name)
   {
     require_param_name_ = param_name;
   }
+
+protected:
+  std::shared_ptr<rclcpp::Node> node_;
 
 private:
   /**
@@ -169,9 +197,9 @@ private:
    * io_service thread to avoid a concurrency nightmare.
    */
   void ros_spin_timeout(const boost::system::error_code& error) {
-    ros_callback_queue_.callAvailable();
+    //ros_callback_queue_.callAvailable();
 
-    if (ros::ok())
+    if (rclcpp::ok())
     {
       // Call again next interval.
       ros_spin_timer_.expires_from_now(ros_spin_interval_);
@@ -188,80 +216,101 @@ private:
   // TODO: Total message timeout, implement primarily in ReadBuffer.
 
   void read_sync_header() {
-    async_read_buffer_.read(1, boost::bind(&Session::read_sync_first, this, _1));
+    async_read_buffer_.read(1, boost::bind(&Session::read_sync_first, this, boost::placeholders::_1));
   }
 
-  void read_sync_first(ros::serialization::IStream& stream) {
+  void read_sync_first(SimpleCdr& stream) {
     uint8_t sync;
     stream >> sync;
+    /**/RCLCPP_DEBUG(node_->get_logger(), "[read_sync_first] sync byte = 0x%02X", sync);
     if (sync == 0xff) {
-      async_read_buffer_.read(1, boost::bind(&Session::read_sync_second, this, _1));
+        //RCLCPP_INFO(node_->get_logger(), "[Rosserial::Session::read_sync_first] Received sync first");
+        async_read_buffer_.read(1, boost::bind(&Session::read_sync_second, this, boost::placeholders::_1));
     } else {
-      read_sync_header();
+        //RCLCPP_INFO(node_->get_logger(), "[Rosserial::Session::read_sync_first] Byte is not sync first %02X", sync);
+        read_sync_header();
     }
   }
 
-  void read_sync_second(ros::serialization::IStream& stream) {
+  void read_sync_second(SimpleCdr& stream) {
     uint8_t sync;
     stream >> sync;
+    RCLCPP_DEBUG(node_->get_logger(), "[read_sync_second] sync byte = 0x%02X", sync);
     if (sync == 0xfe) {
-      async_read_buffer_.read(5, boost::bind(&Session::read_id_length, this, _1));
+        //RCLCPP_INFO(node_->get_logger(), "[Rosserial::Session::read_sync_second] Received sync second");
+        async_read_buffer_.read(5, boost::bind(&Session::read_id_length, this, boost::placeholders::_1));
     } else {
-      read_sync_header();
+        read_sync_header();
     }
   }
 
-  void read_id_length(ros::serialization::IStream& stream) {
-    uint16_t topic_id, length;
+  void read_id_length(SimpleCdr& stream) {
+    uint16_t length;
     uint8_t length_checksum;
 
     // Check header checksum byte for length field.
     stream >> length >> length_checksum;
-    if (length_checksum + checksum(length) != 0xff) {
-      uint8_t csl = checksum(length);
-      ROS_WARN("Bad message header length checksum. Dropping message from client. T%d L%d C%d %d", topic_id, length, length_checksum, csl);
+    uint8_t csl = checksum(length);
+    if (length_checksum + csl != 0xff) {
+      RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::read_id_length] Bad message header length checksum. Dropping message from client. L%d C%02X %02X", length, length_checksum, csl);
       read_sync_header();
       return;
-    } else {
-      stream >> topic_id;
     }
-    ROS_DEBUG("Received message header with length %d and topic_id=%d", length, topic_id);
+    
+    uint16_t topic_id;
+    stream >> topic_id;
+    
+    RCLCPP_DEBUG(node_->get_logger(), "[Rosserial::Session::read_id_length] Received message header with length %d and topic_id=%d", length, topic_id);
 
     // Read message length + checksum byte.
     async_read_buffer_.read(length + 1, boost::bind(&Session::read_body, this,
-                                                    _1, topic_id));
+                                                    boost::placeholders::_1, topic_id));
   }
 
-  void read_body(ros::serialization::IStream& stream, uint16_t topic_id) {
-    ROS_DEBUG("Received body of length %d for message on topic %d.", stream.getLength(), topic_id);
+  void read_body(SimpleCdr& stream, uint16_t topic_id) {
 
-    ros::serialization::IStream checksum_stream(stream.getData(), stream.getLength());
-    uint8_t msg_checksum = checksum(checksum_stream) + checksum(topic_id);
+    if (!is_active()) {
+      RCLCPP_DEBUG(node_->get_logger(), "[Rosserial::Session::read_body] Request to shutdown while receiving msg, aborting read_body...");
+      return;
+    }
 
+    RCLCPP_DEBUG(node_->get_logger(), "[Rosserial::Session::read_body] Received body of length %d for message on topic %d.", stream.getLength(), topic_id);
+
+    uint8_t msg_checksum = checksum(stream) + checksum(topic_id);
     if (msg_checksum != 0xff) {
-      ROS_WARN("Rejecting message on topicId=%d, length=%d with bad checksum.", topic_id, stream.getLength());
+      RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::read_body] Rejecting message on topicId=%d, name = %s, length=%d with bad checksum.", topic_id, topics_names_[topic_id].c_str(), stream.getLength());
     } else {
       if (callbacks_.count(topic_id) == 1) {
         try {
           // stream includes the check sum byte. 
-          ros::serialization::IStream msg_stream(stream.getData(), stream.getLength()-1);
+          SimpleCdr msg_stream(stream.getData(), stream.getLength()-1);
+          //fprintf(stderr, "==>>> Callback to topic_id %d\n", topic_id);
           callbacks_[topic_id](msg_stream);
-        } catch(ros::serialization::StreamOverrunException e) {
+        //} catch(ros::serialization::StreamOverrunException e) {
+        } catch(std::exception &e) {
+            fprintf(stderr, "EXCEPTION: %s\n", e.what());
           if (topic_id < 100) {
-            ROS_ERROR("Buffer overrun when attempting to parse setup message.");
-            ROS_ERROR_ONCE("Is this firmware from a pre-Groovy rosserial?");
+            RCLCPP_ERROR(node_->get_logger(), "[Rosserial::Session::read_body] Buffer overrun when attempting to parse setup message topic_id=%d.", topic_id);
+            RCLCPP_ERROR_ONCE(node_->get_logger(), "[Rosserial::Session::read_body] Is this firmware from a pre-Groovy rosserial?");
           } else {
-            ROS_WARN("Buffer overrun when attempting to parse user message.");
+            RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::read_body] Buffer overrun when attempting to parse user message.");
           }
         }
       } else {
-        ROS_WARN("Received message with unrecognized topicId (%d).", topic_id);
+        if(topics_names_.size() > topic_id)
+        {
+          RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::read_body] Received message with unrecognized topicId (%d), number of counts is %u, name is '%s'.", topic_id, static_cast<uint32_t>(callbacks_.count(topic_id)), topics_names_[topic_id].c_str());
+        }
+        else
+        {
+          RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::read_body] Received message with unrecognized topicId (%d), number of counts is %u, name not available.", topic_id, static_cast<uint32_t>(callbacks_.count(topic_id)));
+        }
 
         if ((unrecognised_topic_retry_threshold_ > 0) && ++unrecognised_topics_ >= unrecognised_topic_retry_threshold_)
         {
           // The threshold for unrecognised topics has been exceeded.
           // Attempt to request the topics from the client again
-          ROS_WARN("Unrecognised topic threshold exceeded. Requesting topics from client");
+          RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::read_body] Unrecognised topic threshold exceeded. Requesting topics from client");
           attempt_sync();
           unrecognised_topics_ = 0;
         }
@@ -275,48 +324,58 @@ private:
   void read_failed(const boost::system::error_code& error) {
     if (error == boost::system::errc::no_buffer_space) {
       // No worries. Begin syncing on a new message.
-      ROS_WARN("Overrun on receive buffer. Attempting to regain rx sync.");
+      RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::read_failed] Overrun on receive buffer. Attempting to regain rx sync.");
       read_sync_header();
     } else if (error) {
       // When some other read error has occurred, stop the session, which destroys
       // all known publishers and subscribers.
-      ROS_WARN_STREAM("Socket asio error, closing socket: " << error);
+      RCLCPP_WARN_STREAM(node_->get_logger(), "[Rosserial::Session::read_failed] Socket asio error, closing socket: " << error);
       stop();
     }
   }
 
   //// SENDING MESSAGES ////
-
-  void write_message(Buffer& message, const uint16_t topic_id) {
-    uint8_t overhead_bytes = 8;
-    uint16_t length = overhead_bytes + message.size();
-    BufferPtr buffer_ptr(new Buffer(length));
-
-    uint8_t msg_checksum;
-    ros::serialization::IStream checksum_stream(message.size() > 0 ? &message[0] : NULL, message.size());
-
-    ros::serialization::OStream stream(&buffer_ptr->at(0), buffer_ptr->size());
-    uint8_t msg_len_checksum = 255 - checksum(message.size());
-    stream << (uint16_t)0xfeff << (uint16_t)message.size() << msg_len_checksum << topic_id;
-    msg_checksum = 255 - (checksum(checksum_stream) + checksum(topic_id));
-
-    memcpy(stream.advance(message.size()), &message[0], message.size());
-    stream << msg_checksum;
-
-    ROS_DEBUG_NAMED("async_write", "Sending buffer of %d bytes to client.", length);
+  void write_buffer(BufferPtr buffer_ptr) {  
     boost::asio::async_write(socket_, boost::asio::buffer(*buffer_ptr),
           boost::bind(&Session::write_completion_cb, this, boost::asio::placeholders::error, buffer_ptr));
+  }
+
+  void write_message(Buffer& message, const uint16_t topic_id) {
+    const uint8_t overhead_bytes = 8; // introduced by rosserial protocol
+    uint16_t length = overhead_bytes + message.size();
+
+    BufferPtr buffer_ptr(new Buffer(length));
+
+    uint8_t msg_checksum = 255 - (checksum(message) + checksum(topic_id));
+    SimpleCdr stream(buffer_ptr->data(), buffer_ptr->size());
+    uint8_t msg_len_checksum = 255 - checksum(message.size());
+
+    stream << (uint16_t)0xfeff << (uint16_t)message.size() << msg_len_checksum << topic_id << message << msg_checksum;
+    //fprintf(stderr, "[topic=%d] ", topic_id); stream.print("[write_message]");
+
+    /*
+    fprintf(stderr, "[write_message] ");
+    for (size_t i = 0; i < buffer_ptr->size(); i++)
+    {
+        fprintf(stderr, "%02hhX ", buffer_ptr->data()[i]);
+    }
+    fprintf(stderr, "\n");
+    */
+
+    RCLCPP_DEBUG(node_->get_logger(), "[Rosserial::Session::write_message] Sending buffer of %d bytes to client.", length);
+    boost::lock_guard<boost::mutex> lock(mutex_); 
+    io_service_.dispatch(boost::bind(&Session::write_buffer, this, buffer_ptr));
   }
 
   void write_completion_cb(const boost::system::error_code& error,
                            BufferPtr buffer_ptr) {
     if (error) {
       if (error == boost::system::errc::io_error) {
-        ROS_WARN_THROTTLE(1, "Socket write operation returned IO error.");
+        //ROS_WARN_THROTTLE(1, "[Rosserial::Session::write_completion_cb] Socket write operation returned IO error.");
       } else if (error == boost::system::errc::no_such_device) {
-        ROS_WARN_THROTTLE(1, "Socket write operation returned no device.");
+        //ROS_WARN_THROTTLE(1, "[Rosserial::Session::write_completion_cb] Socket write operation returned no device.");
       } else {
-        ROS_WARN_STREAM_THROTTLE(1, "Unknown error returned during write operation: " << error);
+        //ROS_WARN_STREAM_THROTTLE(1, "[Rosserial::Session::write_completion_cb] Unknown error returned during write operation: " << error);
       }
       stop();
     }
@@ -330,7 +389,7 @@ private:
   }
 
   void set_sync_timeout(const boost::posix_time::time_duration& interval) {
-    if (ros::ok())
+    if (rclcpp::ok())
     {
       sync_timer_.cancel();
       sync_timer_.expires_from_now(interval);
@@ -345,7 +404,7 @@ private:
 
   void sync_timeout(const boost::system::error_code& error) {
     if (error != boost::asio::error::operation_aborted) {
-      ROS_DEBUG("Sync with device lost.");
+      RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::sync_timeout] Sync with device lost.*********");
       stop();
     }
   }
@@ -353,8 +412,8 @@ private:
   //// HELPERS ////
   void request_topics() {
     std::vector<uint8_t> message(0);
-    ROS_DEBUG("Sending request topics message for VER2 protocol.");
-    write_message(message, rosserial_msgs::TopicInfo::ID_PUBLISHER);
+    RCLCPP_INFO(node_->get_logger(), "[Rosserial::Session::request_topics] Sending request topics message for VER2 protocol.");
+    write_message(message, rosserial_msgs::msg::TopicInfo::ID_PUBLISHER);
 
     // Set timer for future point at which to verify the subscribers and publishers
     // created by the client against the expected set given in the parameters.
@@ -364,24 +423,27 @@ private:
   }
 
   void required_topics_check(const boost::system::error_code& error) {
+    /*
     if (error != boost::asio::error::operation_aborted) {
       if (ros::param::has(require_param_name_)) {
         if (!check_set(require_param_name_ + "/publishers", publishers_) ||
             !check_set(require_param_name_ + "/subscribers", subscribers_)) {
-          ROS_WARN("Connected client failed to establish the publishers and subscribers dictated by require parameter. Re-requesting topics.");
+          RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::required_topics_check] Connected client failed to establish the publishers and subscribers dictated by require parameter. Re-requesting topics.");
           request_topics();
         }
       }
     }
+    */
   }
 
+  /*
   template<typename M>
-  bool check_set(std::string param_name, M map) {
+  bool check_set(const std::string & param_name, M & map) {
     XmlRpc::XmlRpcValue param_list;
     ros::param::get(param_name, param_list);
-    ROS_ASSERT(param_list.getType() == XmlRpc::XmlRpcValue::TypeArray);
+    rcpputils::assert_true(param_list.getType() == XmlRpc::XmlRpcValue::TypeArray);
     for (int i = 0; i < param_list.size(); ++i) {
-      ROS_ASSERT(param_list[i].getType() == XmlRpc::XmlRpcValue::TypeString);
+      rcpputils::assert_true(param_list[i].getType() == XmlRpc::XmlRpcValue::TypeString);
       std::string required_topic((std::string(param_list[i])));
       // Iterate through map of registered topics, to ensure that this one is present.
       bool found = false;
@@ -389,19 +451,20 @@ private:
         if (nh_.resolveName(j->second->get_topic()) ==
             nh_.resolveName(required_topic)) {
           found = true;
-          ROS_INFO_STREAM("Verified connection to topic " << required_topic << ", given in parameter " << param_name);
+          RCLCPP_INFO_STREAM(node_->get_logger(), "[Rosserial::Session::check_set] Verified connection to topic " << required_topic << ", given in parameter " << param_name);
           break;
         }
       }
       if (!found) {
-        ROS_WARN_STREAM("Missing connection to topic " << required_topic << ", required by parameter " << param_name);
+        RCLCPP_WARN_STREAM(node_->get_logger(), "[Rosserial::Session::check_set] Missing connection to topic " << required_topic << ", required by parameter " << param_name);
         return false;
       }
     }
     return true;
   }
-
-  static uint8_t checksum(ros::serialization::IStream& stream) {
+  */
+ 
+  static uint8_t checksum(SimpleCdr& stream) {
     uint8_t sum = 0;
     for (uint16_t i = 0; i < stream.getLength(); ++i) {
       sum += stream.getData()[i];
@@ -409,30 +472,62 @@ private:
     return sum;
   }
 
+  static uint8_t checksum(Buffer& stream) {
+    uint8_t sum = 0;
+    for (uint16_t i = 0; i < stream.size(); ++i) {
+      sum += stream[i];
+    }
+    return sum;
+  }
+  
+
   static uint8_t checksum(uint16_t val) {
     return (val >> 8) + val;
   }
 
   //// RECEIVED MESSAGE HANDLERS ////
 
-  void setup_publisher(ros::serialization::IStream& stream) {
-    rosserial_msgs::TopicInfo topic_info;
-    ros::serialization::Serializer<rosserial_msgs::TopicInfo>::read(stream, topic_info);
+  void setup_publisher(SimpleCdr& stream)
+  {
+    try {
+        rosserial_msgs::msg::TopicInfo topic_info;
+        rclcpp::SerializedMessage serialized_msg = stream.asSerializedMessage();
+        rclcpp::Serialization<rosserial_msgs::msg::TopicInfo> serializer;
+        serializer.deserialize_message(&serialized_msg, &topic_info);
 
-    PublisherPtr pub(new Publisher(nh_, topic_info));
-    callbacks_[topic_info.topic_id] = boost::bind(&Publisher::handle, pub, _1);
-    publishers_[topic_info.topic_id] = pub;
+        RCLCPP_INFO(node_->get_logger(), "[Rosserial::Session::setup_publisher] Setting up publisher for topic: %s  message type: %s", topic_info.topic_name.c_str(), topic_info.message_type.c_str());
 
-    set_sync_timeout(timeout_interval_);
+        PublisherPtr pub(new Publisher(node_, topic_info));
+        callbacks_[topic_info.topic_id] = std::bind(&Publisher::handle, pub, std::placeholders::_1);
+        publishers_[topic_info.topic_id] = pub;
+        topics_names_[topic_info.topic_id] = topic_info.topic_name;
+
+        set_sync_timeout(timeout_interval_);
+    } catch(...) {
+        RCLCPP_ERROR(node_->get_logger(), "Error trying to deserialize TopicInfo buffer");
+    }
   }
 
-  void setup_subscriber(ros::serialization::IStream& stream) {
-    rosserial_msgs::TopicInfo topic_info;
-    ros::serialization::Serializer<rosserial_msgs::TopicInfo>::read(stream, topic_info);
+  void setup_subscriber(SimpleCdr& stream)
+  {
+    rosserial_msgs::msg::TopicInfo topic_info;
+    rclcpp::SerializedMessage serialized_msg = stream.asSerializedMessage();
+    rclcpp::Serialization<rosserial_msgs::msg::TopicInfo> serializer;
+    serializer.deserialize_message(&serialized_msg, &topic_info);
 
-    SubscriberPtr sub(new Subscriber(nh_, topic_info,
-        boost::bind(&Session::write_message, this, _1, topic_info.topic_id)));
-    subscribers_[topic_info.topic_id] = sub;
+    RCLCPP_INFO(node_->get_logger(), "[Rosserial::Session::setup_subscriber] Setting up subscriber to topic: %s  message type: %s", topic_info.topic_name.c_str(), topic_info.message_type.c_str());
+
+    try
+    {
+        SubscriberPtr sub(new Subscriber(node_, topic_info,
+            boost::bind(&Session::write_message, this, boost::placeholders::_1, topic_info.topic_id)));
+        subscribers_[topic_info.topic_id] = sub;
+    }
+    catch(const std::exception& e)
+    {
+      RCLCPP_ERROR(node_->get_logger(), "[Rosserial::Session::setup_subscriber] Setting up subscriber to topic failed: %s  message type: %s", topic_info.topic_name.c_str(), topic_info.message_type.c_str());
+    }
+
 
     set_sync_timeout(timeout_interval_);
   }
@@ -443,69 +538,152 @@ private:
   // and wish to send it over the socket to the client,
   // we must attach the topicId that came from the service client subscriber message
 
-  void setup_service_client_publisher(ros::serialization::IStream& stream) {
-    rosserial_msgs::TopicInfo topic_info;
-    ros::serialization::Serializer<rosserial_msgs::TopicInfo>::read(stream, topic_info);
+  void setup_service_client_publisher(SimpleCdr& stream) {
+    rosserial_msgs::msg::TopicInfo topic_info;
+    rclcpp::SerializedMessage serialized_msg = stream.asSerializedMessage();
+    rclcpp::Serialization<rosserial_msgs::msg::TopicInfo> serializer;
+    serializer.deserialize_message(&serialized_msg, &topic_info);
 
-    if (!services_.count(topic_info.topic_name)) {
-      ROS_DEBUG("Creating service client for topic %s",topic_info.topic_name.c_str());
-      ServiceClientPtr srv(new ServiceClient(
-        nh_,topic_info,boost::bind(&Session::write_message, this, _1, _2)));
-      services_[topic_info.topic_name] = srv;
-      callbacks_[topic_info.topic_id] = boost::bind(&ServiceClient::handle, srv, _1);
+    if (!service_clients_.count(topic_info.topic_name))
+    {
+        RCLCPP_DEBUG(node_->get_logger(), "[Rosserial::Session::setup_service_client_publisher] Creating service client for topic %s",topic_info.topic_name.c_str());
+        ServiceClientPtr srv(new ServiceClient(
+            node_,topic_info,boost::bind(&Session::write_message, this, boost::placeholders::_1, boost::placeholders::_2), services_map_));
+        service_clients_[topic_info.topic_name] = srv;
+        callbacks_[topic_info.topic_id] = std::bind(&ServiceClient::handle, srv, std::placeholders::_1);
+        topics_names_[topic_info.topic_id] = topic_info.topic_name;
     }
-    if (services_[topic_info.topic_name]->getRequestMessageMD5() != topic_info.md5sum) {
-      ROS_WARN("Service client setup: Request message MD5 mismatch between rosserial client and ROS");
+
+    std::string hostHash = service_clients_[topic_info.topic_name]->getRequestMessageMD5();
+    if (hostHash != topic_info.md5sum)
+    {
+        RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::setup_service_client_publisher] Service client setup: Request message MD5 mismatch between rosserial client and ROS: %s\nhost:%s\nembedded:%s", topic_info.topic_name.c_str(), hostHash.c_str(), topic_info.md5sum.c_str());
     } else {
-      ROS_DEBUG("Service client %s: request message MD5 successfully validated as %s",
-        topic_info.topic_name.c_str(),topic_info.md5sum.c_str());
+        RCLCPP_DEBUG(node_->get_logger(), "[Rosserial::Session::setup_service_client_publisher] Service client %s: request message MD5 successfully validated as %s",
+            topic_info.topic_name.c_str(),topic_info.md5sum.c_str());
     }
+
     set_sync_timeout(timeout_interval_);
   }
 
-  void setup_service_client_subscriber(ros::serialization::IStream& stream) {
-    rosserial_msgs::TopicInfo topic_info;
-    ros::serialization::Serializer<rosserial_msgs::TopicInfo>::read(stream, topic_info);
+  void setup_service_client_subscriber(SimpleCdr& stream) {
+    rosserial_msgs::msg::TopicInfo topic_info;
+    rclcpp::SerializedMessage serialized_msg = stream.asSerializedMessage();
+    rclcpp::Serialization<rosserial_msgs::msg::TopicInfo> serializer;
+    serializer.deserialize_message(&serialized_msg, &topic_info);
 
-    if (!services_.count(topic_info.topic_name)) {
-      ROS_DEBUG("Creating service client for topic %s",topic_info.topic_name.c_str());
+
+    if (!service_clients_.count(topic_info.topic_name)) {
+      RCLCPP_DEBUG(node_->get_logger(), "[Rosserial::Session::setup_service_client_subscriber] Creating service client for topic %s",topic_info.topic_name.c_str());
       ServiceClientPtr srv(new ServiceClient(
-        nh_,topic_info,boost::bind(&Session::write_message, this, _1, _2)));
-      services_[topic_info.topic_name] = srv;
-      callbacks_[topic_info.topic_id] = boost::bind(&ServiceClient::handle, srv, _1);
+        node_,topic_info,boost::bind(&Session::write_message, this, boost::placeholders::_1, boost::placeholders::_2), services_map_));
+      service_clients_[topic_info.topic_name] = srv;
+      callbacks_[topic_info.topic_id] = std::bind(&ServiceClient::handle, srv, std::placeholders::_1);
+      topics_names_[topic_info.topic_id] = topic_info.topic_name;
     }
     // see above comment regarding the service client callback for why we set topic_id here
-    services_[topic_info.topic_name]->setTopicId(topic_info.topic_id);
-    if (services_[topic_info.topic_name]->getResponseMessageMD5() != topic_info.md5sum) {
-      ROS_WARN("Service client setup: Response message MD5 mismatch between rosserial client and ROS");
+    service_clients_[topic_info.topic_name]->setTopicId(topic_info.topic_id);
+    if (service_clients_[topic_info.topic_name]->getResponseMessageMD5() != topic_info.md5sum) {
+      RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::setup_service_client_subscriber] Service client setup: Response message MD5 mismatch between rosserial client and ROS: %s", topic_info.topic_name.c_str());
     } else {
-      ROS_DEBUG("Service client %s: response message MD5 successfully validated as %s",
+      RCLCPP_DEBUG(node_->get_logger(), "[Rosserial::Session::setup_service_client_subscriber] Service client %s: response message MD5 successfully validated as %s",
         topic_info.topic_name.c_str(),topic_info.md5sum.c_str());
     }
     set_sync_timeout(timeout_interval_);
   }
 
-  void handle_log(ros::serialization::IStream& stream) {
-    rosserial_msgs::Log l;
-    ros::serialization::Serializer<rosserial_msgs::Log>::read(stream, l);
-    if(l.level == rosserial_msgs::Log::ROSDEBUG) ROS_DEBUG("%s", l.msg.c_str());
-    else if(l.level == rosserial_msgs::Log::INFO) ROS_INFO("%s", l.msg.c_str());
-    else if(l.level == rosserial_msgs::Log::WARN) ROS_WARN("%s", l.msg.c_str());
-    else if(l.level == rosserial_msgs::Log::ERROR) ROS_ERROR("%s", l.msg.c_str());
-    else if(l.level == rosserial_msgs::Log::FATAL) ROS_FATAL("%s", l.msg.c_str());
+  // When the rosserial client creates a ServiceServer object (and/or when it registers that object with the NodeHandle)
+  // it creates a "proxy" service server
+  void setup_service_server_publisher(SimpleCdr& stream) {
+    rosserial_msgs::msg::TopicInfo topic_info;
+    rclcpp::SerializedMessage serialized_msg = stream.asSerializedMessage();
+    rclcpp::Serialization<rosserial_msgs::msg::TopicInfo> serializer;
+    serializer.deserialize_message(&serialized_msg, &topic_info);
+
+    if (!service_servers_.count(topic_info.topic_name)) {
+      RCLCPP_INFO(node_->get_logger(), "[Rosserial::Session::setup_service_server_publisher] Creating service server publisher for topic %s",topic_info.topic_name.c_str());
+      ServiceServerPtr srv(new ServiceServer(node_, topic_info, buffer_max, boost::bind(&Session::write_message, this, boost::placeholders::_1, boost::placeholders::_2), services_no_response_timeout_ms_, services_map_));
+      service_servers_[topic_info.topic_name] = srv;
+      callbacks_[topic_info.topic_id] = std::bind(&ServiceServer::response_handle, srv, std::placeholders::_1);
+      topics_names_[topic_info.topic_id] = topic_info.topic_name;
+    }
+    if (service_servers_[topic_info.topic_name]->getResponseMessageMD5() != topic_info.md5sum) {
+      RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::setup_service_server_publisher] Service server setup: Response message MD5 mismatch between rosserial server and ROS: %s", topic_info.topic_name.c_str());
+      RCLCPP_WARN(node_->get_logger(), "%s  and %s", service_servers_[topic_info.topic_name]->getResponseMessageMD5().c_str(), topic_info.md5sum.c_str());
+    } else {
+      RCLCPP_DEBUG(node_->get_logger(), "[Rosserial::Session::setup_service_server_publisher] Service server %s: response message MD5 successfully validated as %s",
+               topic_info.topic_name.c_str(),topic_info.md5sum.c_str());
+    }
+    set_sync_timeout(timeout_interval_);
   }
 
-  void handle_time(ros::serialization::IStream& stream) {
-    std_msgs::Time time;
-    time.data = ros::Time::now();
+  void setup_service_server_subscriber(SimpleCdr& stream) {
+    rosserial_msgs::msg::TopicInfo topic_info;
+    rclcpp::SerializedMessage serialized_msg = stream.asSerializedMessage();
+    rclcpp::Serialization<rosserial_msgs::msg::TopicInfo> serializer;
+    serializer.deserialize_message(&serialized_msg, &topic_info);
 
-    size_t length = ros::serialization::serializationLength(time);
-    std::vector<uint8_t> message(length);
+    if (!service_servers_.count(topic_info.topic_name)) {
+      RCLCPP_INFO(node_->get_logger(), "[Rosserial::Session::setup_service_server_subscriber] Creating service server subscriber for topic %s",topic_info.topic_name.c_str());
+      ServiceServerPtr srv(new ServiceServer(node_, topic_info, buffer_max, boost::bind(&Session::write_message, this, boost::placeholders::_1, boost::placeholders::_2), services_no_response_timeout_ms_, services_map_));
+      service_servers_[topic_info.topic_name] = srv;
+      callbacks_[topic_info.topic_id] = std::bind(&ServiceServer::response_handle, srv, std::placeholders::_1);
+      topics_names_[topic_info.topic_id] = topic_info.topic_name;
+    }
 
-    ros::serialization::OStream ostream(&message[0], length);
-    ros::serialization::Serializer<std_msgs::Time>::write(ostream, time);
+    // see above comment regarding the service server callback for why we set topic_id here
+    service_servers_[topic_info.topic_name]->setTopicId(topic_info.topic_id);
+    if (service_servers_[topic_info.topic_name]->getRequestMessageMD5() != topic_info.md5sum) {
+      RCLCPP_WARN(node_->get_logger(), "[Rosserial::Session::setup_service_server_subscriber] Service server setup: Request message MD5 mismatch between rosserial server and ROS: %s", topic_info.topic_name.c_str());
+      RCLCPP_WARN(node_->get_logger(), "%s  and %s", service_servers_[topic_info.topic_name]->getRequestMessageMD5().c_str(), topic_info.md5sum.c_str());
+    } else {
+      RCLCPP_INFO(node_->get_logger(), "[Rosserial::Session::setup_service_server_subscriber] Service server %s: request message MD5 successfully validated as %s",
+               topic_info.topic_name.c_str(),topic_info.md5sum.c_str());
+    }
+    set_sync_timeout(timeout_interval_);
+  }
 
-    write_message(message, rosserial_msgs::TopicInfo::ID_TIME);
+
+  void handle_log(SimpleCdr& stream) {
+    rosserial_msgs::msg::Log l;
+    rclcpp::SerializedMessage serialized_msg = stream.asSerializedMessage();
+    rclcpp::Serialization<rosserial_msgs::msg::Log> serializer;
+    serializer.deserialize_message(&serialized_msg, &l);
+
+    if(l.level == rosserial_msgs::msg::Log::ROSDEBUG) RCLCPP_DEBUG(node_->get_logger(), "%s", l.msg.c_str());
+    else if(l.level == rosserial_msgs::msg::Log::INFO) RCLCPP_INFO(node_->get_logger(), "%s", l.msg.c_str());
+    else if(l.level == rosserial_msgs::msg::Log::WARN) RCLCPP_WARN(node_->get_logger(), "%s", l.msg.c_str());
+    else if(l.level == rosserial_msgs::msg::Log::ERROR) RCLCPP_ERROR(node_->get_logger(), "%s", l.msg.c_str());
+    else if(l.level == rosserial_msgs::msg::Log::FATAL) RCLCPP_FATAL(node_->get_logger(), "%s", l.msg.c_str());
+  }
+
+  void handle_time(SimpleCdr& stream) {
+    /*
+    fprintf(stderr, "[handle_time::received] ");
+    for (size_t i = 0; i < stream.getLength(); ++i) {
+      fprintf(stderr, "%02x ", stream.getData()[i]);
+    }
+    fprintf(stderr, "\n");
+    */
+
+    rclcpp::Time time = node_->get_clock()->now();
+    builtin_interfaces::msg::Time time_msg(time);
+    rclcpp::SerializedMessage serialized_msg;
+    rclcpp::Serialization<builtin_interfaces::msg::Time> serializer;
+    serializer.serialize_message(&time_msg, &serialized_msg);
+
+    /*
+    fprintf(stderr, "[handle_time::send    ] ");
+    const rcl_serialized_message_t & sm = serialized_msg.get_rcl_serialized_message();
+    for (size_t i = 0; i < serialized_msg.size(); ++i) {
+      fprintf(stderr, "%02x ", sm.buffer[i]);
+    }
+    fprintf(stderr, "\n");
+    */
+
+    std::vector<uint8_t> message(serialized_msg.size());
+    memcpy(message.data(), serialized_msg.get_rcl_serialized_message().buffer, message.size());
+    write_message(message, rosserial_msgs::msg::TopicInfo::ID_TIME);
 
     // The MCU requesting the time from the server is the sync notification. This
     // call moves the timeout forward.
@@ -515,11 +693,11 @@ private:
   boost::asio::io_service& io_service_;
   Socket socket_;
   AsyncReadBuffer<Socket> async_read_buffer_;
-  enum { buffer_max = 1023 };
+  enum { buffer_max = 8192-1 };
   bool active_;
+  int services_no_response_timeout_ms_;
 
-  ros::NodeHandle nh_;
-  ros::CallbackQueue ros_callback_queue_;
+  boost::mutex mutex_;
 
   boost::posix_time::time_duration timeout_interval_;
   boost::posix_time::time_duration attempt_interval_;
@@ -532,10 +710,14 @@ private:
   int unrecognised_topic_retry_threshold_{ 0 };
   int unrecognised_topics_{ 0 };
 
-  std::map<uint16_t, boost::function<void(ros::serialization::IStream&)> > callbacks_;
+  std::map<uint16_t, std::function<void(SimpleCdr&)> > callbacks_;
   std::map<uint16_t, PublisherPtr> publishers_;
   std::map<uint16_t, SubscriberPtr> subscribers_;
-  std::map<std::string, ServiceClientPtr> services_;
+  std::map<std::string, ServiceClientPtr> service_clients_;
+  std::map<std::string, ServiceServerPtr> service_servers_;
+  std::map<uint16_t, std::string> topics_names_;
+
+  ConversionMap services_map_;
 };
 
 }  // namespace

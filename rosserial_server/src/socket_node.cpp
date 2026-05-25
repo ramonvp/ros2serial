@@ -32,7 +32,7 @@
  */
 
 #include <boost/asio.hpp>
-#include <boost/bind.hpp>
+//#include <boost/bind/bind.hpp>
 #include <boost/thread.hpp>
 
 #include <ros/ros.h>
@@ -52,5 +52,5 @@ int main(int argc, char* argv[])
 
   ROS_INFO_STREAM("Listening for rosserial TCP connections on port " << port);
   io_service.run();
-  return 0;
+  return EXIT_SUCCESS;
 }

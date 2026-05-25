@@ -26,77 +26,119 @@
  *
  * Please send comments, questions, or patches to code@clearpathrobotics.com
  */
-
+#include <algorithm>
+#include <rapidjson/rapidjson.h>
+#include <rapidjson/document.h>
+#include <rapidjson/filereadstream.h>
+#include <iostream>
+#include <vector>
 #include "rosserial_server/msg_lookup.h"
-#include "Python.h"
+#include <ament_index_cpp/get_package_share_directory.hpp>
+#include <ament_index_cpp/get_package_prefix.hpp>
+
 
 namespace rosserial_server
 {
 
-const MsgInfo lookupMessage(const std::string& message_type, const std::string submodule)
+struct PackageInfo
 {
-  // Lazy-initialize the embedded Python interpreter. Avoid calling the corresponding
-  // finalize method due to issues with importing cyaml in the second instance. The
-  // total memory cost of having this in-process is only about 5-6MB.
-  Py_Initialize();
+    std::string package_name;   // package name (i.e std_msgs, geometry_msgs, ...)
+    std::string interface_type; // msg or srv
+    std::string type_name;      // type name (i.e. Int32, PoseStamped, etc...)
+};
 
-  MsgInfo msginfo;
-  size_t slash_pos = message_type.find('/');
-  if (slash_pos == std::string::npos)
-  {
-    throw std::runtime_error("Passed message type string does not include a slash character.");
-  }
-  std::string module_name = message_type.substr(0, slash_pos);
-  std::string class_name = message_type.substr(slash_pos + 1, std::string::npos);
+std::ostream& operator<<(std::ostream& os, PackageInfo const& info)
+{
+    os << "package_name = " << info.package_name << ", interface_type = " << info.interface_type << ", type_name = " << info.type_name;
+    return os;
+}
 
-  PyObject* module = PyImport_ImportModule((module_name + "." + submodule).c_str());
-  if (!module)
-  {
-    throw std::runtime_error("Unable to import message module " + module_name + ".");
-  }
-  PyObject* msg_class = PyObject_GetAttrString(module, class_name.c_str());
-  if (!msg_class)
-  {
-    throw std::runtime_error("Unable to find message class " + class_name +
-                             " in module " + module_name + ".");
-  }
-  Py_XDECREF(module);
+PackageInfo split(const std::string str)
+{
+    std::vector<std::string> fields;
+    const char del = '/';
+    std::size_t pos = str.find(del);
+    std::size_t prev = 0;
 
-  PyObject* full_text = PyObject_GetAttrString(msg_class, "_full_text");
-  PyObject* md5sum = PyObject_GetAttrString(msg_class, "_md5sum");
-  if (!md5sum)
-  {
-    throw std::runtime_error("Class for message " + message_type + " did not contain" +
-                             "expected _md5sum attribute.");
-  }
-  Py_XDECREF(msg_class);
+    while (pos != std::string::npos) {
+        fields.push_back(str.substr(prev, pos-prev));
+        prev = pos+1;
+        pos = str.find(del, prev);
+    }
 
-#if PY_VERSION_HEX > 0x03000000
-  if (full_text)
-  {
-    msginfo.full_text.assign(PyUnicode_AsUTF8(full_text));
-  }
-  msginfo.md5sum.assign(PyUnicode_AsUTF8(md5sum));
-#else
-  if (full_text)
-  {
-    msginfo.full_text.assign(PyString_AsString(full_text));
-  }
-  msginfo.md5sum.assign(PyString_AsString(md5sum));
-#endif
+    if (prev < str.size()) {
+        fields.push_back(str.substr(prev));
+    }
 
-  // See https://github.com/ros/ros_comm/issues/344
-  // and https://github.com/ros/gencpp/pull/14
-  // Valid full_text returned, but it is empty, so insert single line
-  if (full_text && msginfo.full_text.empty())
-  {
-    msginfo.full_text = "\n";
-  }
+    if (fields.size() != 3)
+    {
+        throw std::invalid_argument("interface name does not have 3 parts");
+    }
 
-  Py_XDECREF(full_text);
-  Py_XDECREF(md5sum);
+    return PackageInfo {fields[0], fields[1], fields[2]};
+}
 
-  return msginfo;
+const MsgInfo lookupMessage(const std::string& interface_name, const std::string &suffix)
+{
+    MsgInfo msginfo;
+
+    if (std::count(interface_name.begin(), interface_name.end(), '/') != 2)
+    {
+        std::cerr << "Invalid interface name, should have 3 parts" << std::endl;
+        return msginfo;
+    }
+
+    PackageInfo package_info = split(interface_name);
+    //std::cout << package_info << std::endl;
+    std::string package_share_directory;
+    try {
+        package_share_directory = ament_index_cpp::get_package_share_directory(package_info.package_name);
+    } catch (const ament_index_cpp::PackageNotFoundError & exception) {
+        std::cerr << "Package not found: " << package_info.package_name << std::endl;
+        std::cerr << exception.what() << std::endl;
+        return msginfo;
+    }
+
+    //fprintf(stderr, "package_path = %s\n", package_share_directory.c_str());
+
+    using namespace rapidjson;
+    std::string msg_json = package_share_directory + "/" + package_info.interface_type + "/" + package_info.type_name + ".json";
+    FILE* fp = fopen(msg_json.c_str(), "r");
+	
+	if(nullptr == fp)
+    {
+        std::cerr << "Json file not found: " << msg_json << std::endl;
+		return msginfo;
+    }
+ 
+	try
+	{
+		char readBuffer[65536];
+		FileReadStream is(fp, readBuffer, sizeof(readBuffer));	 
+		fclose(fp);
+		 
+		Document document;
+		document.ParseStream(is);
+		
+        //std::cout << "Json parsed successfully" << std::endl;
+        //std::cout << document["type_hashes"][0]["hash_string"].GetString() << std::endl;
+        const std::string full_type_name = interface_name + suffix;
+        for (auto it = document["type_hashes"].Begin(); it != document["type_hashes"].End(); ++it)
+        {
+            if( full_type_name == it->GetObject()["type_name"].GetString() )
+            {
+                msginfo.md5sum = it->GetObject()["hash_string"].GetString();
+                break;
+            }
+        }
+	}
+	catch(std::exception& exp)
+	{
+		std::cerr << exp.what() << std::endl;
+		return msginfo;
+	}
+
+    return msginfo;
 }
 
 }  // namespace rosserial_server
