@@ -22,24 +22,24 @@ jobs:
       - name: Setup ROS 2
         uses: ros-tooling/setup-ros@0.7.18
 
-    - name: build and test
-      uses: ros-tooling/action-ros-ci@0.4.8
-      with:
-        package-name: rosserial_msgs rosserial_server rosserial_stm32
-        target-ros2-distro: jazzy
+      - name: build and test
+        uses: ros-tooling/action-ros-ci@0.4.8
+        with:
+          package-name: rosserial_msgs rosserial_server rosserial_stm32
+          target-ros2-distro: jazzy
 
-        colcon-defaults: |
-          {
-            "test": {
-              "parallel-workers": 1
+          colcon-defaults: |
+            {
+              "test": {
+                "parallel-workers": 1
+              }
             }
-          }
 
-        extra-cmake-args: |
-          -DCMAKE_C_FLAGS=--coverage
-          -DCMAKE_CXX_FLAGS=--coverage
+          extra-cmake-args: |
+            -DCMAKE_C_FLAGS=--coverage
+            -DCMAKE_CXX_FLAGS=--coverage
 
-        coverage-result: true
+          coverage-result: true
 
       - name: Codecov
         uses: codecov/codecov-action@v5.4.0
