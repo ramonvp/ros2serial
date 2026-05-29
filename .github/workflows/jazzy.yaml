@@ -35,9 +35,7 @@ jobs:
               }
             }
 
-          extra-cmake-args: |
-            -DCMAKE_C_FLAGS=--coverage
-            -DCMAKE_CXX_FLAGS=--coverage
+          extra-cmake-args: extra-cmake-args: -DCMAKE_C_FLAGS=--coverage -DCMAKE_CXX_FLAGS=--coverage
 
           coverage-result: true
 
