@@ -22,20 +22,25 @@ jobs:
       - name: Setup ROS 2
         uses: ros-tooling/setup-ros@0.7.18
 
-      - name: build and test
-        uses: ros-tooling/action-ros-ci@0.4.8
-        with:
-          package-name: rosserial_msgs rosserial_server rosserial_stm32
-          target-ros2-distro: jazzy
-          #vcs-repo-file-url: ${GITHUB_WORKSPACE}/.github/thirdparty.repos
-          colcon-defaults: |
-            {
-              "test": {
-                "parallel-workers" : 1
-              }
+    - name: build and test
+      uses: ros-tooling/action-ros-ci@0.4.8
+      with:
+        package-name: rosserial_msgs rosserial_server rosserial_stm32
+        target-ros2-distro: jazzy
+
+        colcon-defaults: |
+          {
+            "test": {
+              "parallel-workers": 1
             }
-          colcon-extra-args: --mixin coverage-gcc
-          colcon-mixin-repository: https://raw.githubusercontent.com/colcon/colcon-mixin-repository/master/index.yaml
+          }
+
+        extra-cmake-args: |
+          -DCMAKE_C_FLAGS=--coverage
+          -DCMAKE_CXX_FLAGS=--coverage
+
+        coverage-result: true
+
       - name: Codecov
         uses: codecov/codecov-action@v5.4.0
         with:
