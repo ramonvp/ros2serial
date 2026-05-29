@@ -23,8 +23,6 @@
   <depend>ament_index_cpp</depend>
   <depend>rapidjson-dev</depend>
 
-  <depend>introspection_interfaces</depend>
-
   <build_depend>libboost-thread-dev</build_depend>
   <exec_depend>libboost-thread</exec_depend>
   <!--depend>ros_helper</depend-->

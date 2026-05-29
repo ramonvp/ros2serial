@@ -14,10 +14,6 @@ find_package(fastcdr CONFIG REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(rosserial_msgs REQUIRED)
-#find_package(ros_helper REQUIRED)
-
-find_package(introspection_interfaces REQUIRED)
-
 
 find_package(Boost REQUIRED COMPONENTS
   system
@@ -39,7 +35,7 @@ include_directories(
 add_executable(${PROJECT_NAME}_serial_node src/serial_node.cpp src/msg_lookup.cpp)
 target_link_libraries(${PROJECT_NAME}_serial_node ${Boost_LIBRARIES})
 set_target_properties(${PROJECT_NAME}_serial_node PROPERTIES OUTPUT_NAME serial_node PREFIX "")
-ament_target_dependencies(${PROJECT_NAME}_serial_node rclcpp std_msgs std_srvs rosserial_msgs ament_index_cpp introspection_interfaces)
+ament_target_dependencies(${PROJECT_NAME}_serial_node rclcpp std_msgs std_srvs rosserial_msgs ament_index_cpp)
 
 #add_executable(${PROJECT_NAME}_socket_node src/socket_node.cpp)
 #target_link_libraries(${PROJECT_NAME}_socket_node ${catkin_LIBRARIES} ${PROJECT_NAME}_lookup)

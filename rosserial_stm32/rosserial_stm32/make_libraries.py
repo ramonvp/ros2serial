@@ -698,7 +698,7 @@ def main(args=None):
     # generate messages
     #rosserial_generate(['std_msgs', 'std_srvs'], path)
     #rosserial_generate(['std_msgs','builtin_interfaces','rosserial_msgs', 'std_srvs', 'introspection_interfaces'], path)
-    rosserial_generate(['introspection_interfaces'], path)
+    #rosserial_generate(['introspection_interfaces'], path)
     #make_msg("std_msgs/msg/Int32", path)
 
     #interface = "std_msgs/msg/Int32"

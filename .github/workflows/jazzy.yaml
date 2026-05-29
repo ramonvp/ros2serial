@@ -14,13 +14,16 @@ jobs:
     container:
       image: ubuntu:noble
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v6
         with:
           ref: jazzy
+
       - name: Setup ROS 2
-        uses: ros-tooling/setup-ros@0.7.15
+        uses: ros-tooling/setup-ros@0.7.18
+
       - name: build and test
-        uses: ros-tooling/action-ros-ci@0.4.5
+        uses: ros-tooling/action-ros-ci@0.4.8
         with:
           package-name: rosserial_msgs rosserial_server rosserial_stm32
           target-ros2-distro: jazzy
@@ -31,7 +34,7 @@ jobs:
                 "parallel-workers" : 1
               }
             }
-          colcon-mixin-name: coverage-gcc
+          colcon-extra-args: --mixin coverage-gcc
           colcon-mixin-repository: https://raw.githubusercontent.com/colcon/colcon-mixin-repository/master/index.yaml
       - name: Codecov
         uses: codecov/codecov-action@v5.4.0

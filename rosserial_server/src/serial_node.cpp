@@ -41,8 +41,6 @@
 #include <std_srvs/srv/trigger.hpp>
 #include <std_srvs/srv/empty.hpp>
 
-#include <introspection_interfaces/srv/test.hpp>
-
 #define ENABLE_RATE 0
 
 void run_io_service(boost::asio::io_service* io_service)
@@ -76,12 +74,9 @@ rosserial_server::ConversionMap createConversionMap()
 {
     rosserial_server::ConversionMap converter_map;
 
-    //ADD_MAP_ENTRY(converter_map, introspection_interfaces::srv::Test);
     ADD_MAP_ENTRY(converter_map, std_srvs::srv::SetBool);
     ADD_MAP_ENTRY(converter_map, std_srvs::srv::Trigger);
     ADD_MAP_ENTRY(converter_map, std_srvs::srv::Empty);
-
-    ADD_MAP_ENTRY(converter_map, introspection_interfaces::srv::Test);
 
     return converter_map;
 }
