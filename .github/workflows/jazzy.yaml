@@ -22,7 +22,7 @@ jobs:
       - name: build and test
         uses: ros-tooling/action-ros-ci@0.4.5
         with:
-          package-name: rosserial_msgs rosserial_server rosserial_client rosserial_arduino rosserial_stm32
+          package-name: rosserial_msgs rosserial_server rosserial_stm32
           target-ros2-distro: jazzy
           #vcs-repo-file-url: ${GITHUB_WORKSPACE}/.github/thirdparty.repos
           colcon-defaults: |
@@ -36,8 +36,8 @@ jobs:
       - name: Codecov
         uses: codecov/codecov-action@v5.4.0
         with:
+          token: ${{ secrets.CODECOV_TOKEN }}
           files: ros_ws/lcov/total_coverage.info
           flags: unittests
           name: codecov-umbrella
-          # yml: ./codecov.yml
           fail_ci_if_error: false
