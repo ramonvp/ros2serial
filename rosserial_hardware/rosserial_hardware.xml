@@ -1,0 +1,10 @@
+<library path="rosserial_hardware">
+  <class name="rosserial_hardware/RosserialSystem"
+         type="rosserial_hardware::RosserialSystem"
+         base_class_type="hardware_interface::SystemInterface">
+    <description>
+      SystemInterface that exchanges joint states/commands with a rosserial
+      microcontroller over a serial port, without ROS topics.
+    </description>
+  </class>
+</library>

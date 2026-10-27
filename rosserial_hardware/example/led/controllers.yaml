@@ -1,0 +1,15 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 50
+    gpio_controller:
+      type: gpio_controllers/GpioCommandController
+
+gpio_controller:
+  ros__parameters:
+    gpios: [led]
+    command_interfaces:
+      led:
+        interfaces: [digital_output]
+    state_interfaces:
+      led:
+        interfaces: [digital_output]

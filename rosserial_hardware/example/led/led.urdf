@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<!-- Arduino Uno built-in LED (pin 13) exposed as a ros2_control GPIO. -->
+<robot name="arduino_led">
+  <link name="base_link"/>
+
+  <ros2_control name="arduino_uno" type="system">
+    <hardware>
+      <plugin>rosserial_hardware/RosserialSystem</plugin>
+      <param name="port">/dev/ttyACM0</param>
+      <param name="baud">57600</param>
+      <param name="state_topic">led_state</param>
+      <param name="command_topic">led</param>
+    </hardware>
+    <gpio name="led">
+      <command_interface name="digital_output"/>
+      <state_interface name="digital_output"/>
+    </gpio>
+  </ros2_control>
+</robot>
